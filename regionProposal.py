@@ -5,12 +5,6 @@ from tqdm import tqdm
 from selective_search import selective_search
 
 
-def make_ROIs(dataset, save_dir):
-    if not os.path.exists(save_dir):
-        os.mkdir(save_dir)
-    search(dataset, save_dir)
-
-
 def pil2cv(image):
     new_image = np.array(image, dtype=np.uint8)
     if new_image.ndim == 2:
@@ -26,7 +20,7 @@ def search(img_dataset, save_dir):
     mode = 'fast'
     minH = 8
     minW = 8
-    for img, d in tqdm(img_dataset):
+    for _, (img, d) in tqdm(enumerate(img_dataset), total=len(img_dataset), desc='selective search'):
         save_file = d['annotation']['filename'].split('.')[0]
         if os.path.exists(os.path.join(save_dir, save_file + '.npy')):
             continue

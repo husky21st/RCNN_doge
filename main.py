@@ -1,26 +1,15 @@
-import torch
 import torch.nn as nn
-import torch.nn.functional as F
 import torch.optim as optim
-from torch.utils.data import DataLoader, random_split, TensorDataset
-from torchvision import datasets, transforms
-import numpy as np
-import matplotlib.pyplot as plt
-import os
-import random
+from torch.utils.data import DataLoader
+from torchvision import datasets
 from tqdm import tqdm
-from torchvision.models import vgg16_bn, VGG16_BN_Weights
-from pprint import pprint
-from copy import copy
-from sklearn.svm import SVC, LinearSVC
+import cv2
 import argparse
 
 from model import MyModel
-from regionProposal import make_ROIs
-from dataset import MyDataset
+from regionProposal import search
+from dataset import TrainDataset, PredictDataset
 from utils import *
-from API_mAP_detect_txt import *
-
 
 
 def get_VOCData(path, year):
@@ -33,8 +22,10 @@ def get_VOCData(path, year):
 	return {'train': train, 'val': val, 'trainval': trainval, 'test': test}
 
 
-def train_net(model, train_data, roi_dir, load_model=False):
-	if os.path.exists('cnn_model.pth') and load_model:
+def train_net(model, train_data, roi_dir, model_dir, load_model=False):
+	model_path = os.path.join(model_dir, 'cnn_model.pth')
+	if os.path.exists(model_path) and load_model:
+		print('load model : cnn_model.pth')
 		return None
 	# Hyper Parameters
 	# related by https://github.com/BVLC/caffe/blob/master/models/bvlc_reference_caffenet/solver.prototxt
@@ -46,7 +37,7 @@ def train_net(model, train_data, roi_dir, load_model=False):
 	weight_decay = 0.0005
 	snapshot = 10000
 
-	dataset = MyDataset(train_data, roi_dir, train=True, train_mode='net')
+	dataset = TrainDataset(train_data, roi_dir, train_mode='net')
 	loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
 
 	criterion = nn.CrossEntropyLoss()
@@ -56,20 +47,13 @@ def train_net(model, train_data, roi_dir, load_model=False):
 	itr = 0
 	laps = max_iter // len(loader)
 	model.net.train()
-	model.freeze()
-	model.unfreeze_last_layer()
-	for epoch in tqdm(range(laps), desc='training net'):
-		if epoch == 1:
-			model.unfreeze()
-		for batch, label in tqdm(enumerate(loader), total=len(loader), desc='train batch'):
-			if itr >= max_iter:
-				break
+	for _ in tqdm(range(laps), total=laps, desc='training net'):
+		for _, (batch, label) in tqdm(enumerate(loader), total=len(loader), leave=False, desc='train batch'):
 			for param in model.net.parameters():
 				param.grad = None
 
 			batch = batch.to(model.DEVICE)
 			label = label.to(model.DEVICE).float()
-
 			outputs = model.net(batch)
 
 			loss = criterion(outputs, label)
@@ -83,84 +67,110 @@ def train_net(model, train_data, roi_dir, load_model=False):
 				checkpoint_path = 'cnn_model_' + str(itr) + '.pth'
 				torch.save(model.net.state_dict(), checkpoint_path)
 
-	torch.save(model.net.state_dict(), 'cnn_model.pth')
+	model.save_model(model_path)
 
 
-def train_svm(SVMlist, model, train_data, roi_dir):
-	net_output = list()
-	net_label = list()
-	features_dir = './features'
+def train_svm(model, train_data, roi_dir, model_dir, load_model=False):
+	if os.path.exists(os.path.join(model_dir, 'SVMs')):
+		if os.path.exists(os.path.join(model_dir, 'SVMs', 'linear_19.xml')) and load_model:
+			print('load model : SVM_*.xml')
+			return None
+	else:
+		os.mkdir(os.path.join(model_dir, 'SVMs'))
 
-	dataset = MyDataset(train_data, roi_dir, train=True, train_mode='svm')
-	loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
-
+	kernels = ['linear', 'histogram']
 	model.eval()
-	with torch.inference_mode():
-		for itr, (batch, label) in tqdm(enumerate(loader), total=len(loader), desc='predict feature vec for training svm'):
-			batch = batch.to(model.DEVICE).float()
-			outputs = model.net(batch)
-			outputs = outputs.cpu().detach().numpy()
-			net_output.append(outputs)
-			label = label.numpy()
-			net_label.append(label)
-			if itr % 1000 == 0 and itr:
-				net_output = np.concatenate(net_output)
-				net_label = np.concatenate(net_label)
-				x_train_list = [list() for _ in range(20)]
-				y_train_list = [list() for _ in range(20)]
-				for feature_vec, label in zip(net_output, net_label):
-					if label >= 0:
-						x_train_list[label].append(feature_vec)
-						y_train_list[label].append(1)
-					else:
-						x_train_list[label + 20].append(feature_vec)
-						y_train_list[label + 20].append(0)
-				if not os.path.exists(features_dir):
-					os.mkdir(features_dir)
-				for i in range(20):
-					x_train = np.array(x_train_list[i])
-					y_train = np.array(y_train_list[i])
-					if not os.path.exists(os.path.join(features_dir, str(i))):
-						os.mkdir(os.path.join(features_dir, str(i)))
-					np.save(os.path.join(features_dir, str(i), str(itr)+'_x'), np.array(x_train, dtype=np.float32))
-					np.save(os.path.join(features_dir, str(i), str(itr) + '_y'), np.array(y_train, dtype=np.float32))
-				net_output = list()
-				net_label = list()
+	for label_idx in tqdm(range(20), desc='training svm per class'):
+		dataset = TrainDataset(train_data, roi_dir, train_mode='svm', label_idx=label_idx)
+		loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+		net_output = np.zeros((len(dataset), 4096), np.float32)
+		net_label = np.zeros(len(dataset), np.int32)
+		with torch.inference_mode():
+			for i, (batch, label) in tqdm(enumerate(loader), total=len(loader), leave=False, desc='predict feature vec for training svm'):
+				batch = batch.to(model.DEVICE).float()
+				outputs = model.net(batch)
+				outputs = outputs.cpu().detach().numpy()
+				net_output[i*BATCH_SIZE: i*BATCH_SIZE + len(outputs)] = outputs  # for memory efficiency
+				label = label.numpy()
+				net_label[i*BATCH_SIZE: i*BATCH_SIZE + len(label)] = label
 
-	pprint(net_output)
-	pprint(net_label)
+		for kernel in tqdm(kernels, total=len(kernels), leave=False, desc='training SVMs'):
+			clf = cv2.ml.SVM_create()
+			clf.setType(cv2.ml.SVM_C_SVC)
+			if kernel == 'linear':
+				clf.setKernel(cv2.ml.SVM_LINEAR)
+			elif kernel == 'histogram':
+				clf.setKernel(cv2.ml.SVM_INTER)
+			clf.setGamma(1)
+			clf.setC(1)
+			clf.setTermCriteria((cv2.TERM_CRITERIA_MAX_ITER + cv2.TermCriteria_EPS, 100, 1e-6))
+			clf.train(net_output, cv2.ml.ROW_SAMPLE, net_label)
 
+			svm_path = os.path.join(model_dir, 'SVMs', kernel + '_' + str(label_idx) + '.xml')
+			clf.save(svm_path)
+			del clf
+
+
+def predict(model, test_data, roi_dir, model_dir, detection_dir):
+	clf_list = {'linear': list(), 'histogram': list()}
 	for i in range(20):
-		# x_train = np.array(x_train_list[i])
-		# y_train = np.array(y_train_list[i])
-		SVMlist[i].fit(x_train, y_train)
+		for kernel in clf_list.keys():
+			svm_path = os.path.join(model_dir, 'SVMs', kernel + '_' + str(i) + '.xml')
+			clf_list[kernel].append(cv2.ml.SVM_load(svm_path))
+	model.eval()
+	for i, imgdata in tqdm(enumerate(test_data), total=len(test_data), desc='predict test per image'):
+		net_output = list()
+		net_label = list()
+		dataset = PredictDataset(imgdata, roi_dir)
+		loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+		with torch.inference_mode():
+			for _, (batch, label) in tqdm(enumerate(loader), total=len(loader), leave=False, desc='predict feature vec'):
+				batch = batch.to(model.DEVICE).float()
+				outputs = model.net(batch)
+				outputs = outputs.cpu().detach().numpy()
+				net_output.append(outputs)
+				net_label.append(label)
 
+		net_output = np.concatenate(net_output)  # (N, 4096)
+		net_label = np.concatenate(net_label)  # (N, 4)
 
-def predict(model, SVMlist, test_data, roi_dir):
-	net_output = list()
-	net_label = list()
+		for kernel in clf_list.keys():
+			predict_score = np.zeros((20, len(net_output)), dtype=np.float32)
+			check_predict_score = np.zeros((20, len(net_output)), dtype=bool)
+			for label_idx in tqdm(range(20), leave=False, desc='predict class'):
+				clf = clf_list[kernel][label_idx]
+				svm_output = clf.predict(net_output)[1].ravel()
+				check_svm_output = svm_output == 1
+				check_predict_score[label_idx] = check_svm_output
+				svm_predict_idx = np.where(check_svm_output)[0]
+				if not svm_predict_idx.size:
+					continue
+				ret, alpha, svidx = clf.getDecisionFunction(0)
+				support_vectors = clf.getSupportVectors()
+				w = support_vectors[svidx[0]]  # (i(num_of_SV), 4096)
+				b = ret
+				if kernel == 'linear':
+					predict_score[label_idx, svm_predict_idx] = np.einsum('ik,dk->d', w, net_output[svm_predict_idx]) - b
+				elif kernel == 'histogram':
+					K = np.array([np.minimum(w, net_output[p_idx]) for p_idx in svm_predict_idx], dtype=np.float32)  # Histogram intersection kernel
+					predict_score[label_idx, svm_predict_idx] = np.einsum('ij,djk->d', alpha, K) - b
+				if (svm_output[svm_predict_idx[0]] == 1 and predict_score[label_idx][svm_predict_idx[0]] < 0) or (svm_output[svm_predict_idx[0]] == 0 and predict_score[label_idx][svm_predict_idx[0]] > 0):
+					predict_score[label_idx] *= -1
 
-	dataset = MyDataset(test_data, roi_dir, train=False)
-	loader = DataLoader(dataset, batch_size=BATCH_SIZE, shuffle=False, num_workers=NUM_WORKERS)
+			check_detect_object = check_predict_score.any(axis=0)
+			check_score = predict_score[:, check_detect_object]
+			suppression = nms(net_label[check_detect_object], check_score)
+			detection_list = list()
+			for target_id, label, score in suppression:
+				target = TARGET_LIST[target_id]
+				predict_data_info = target + ' ' + str(score) + ' ' + ' '.join(list(map(str, label)))
+				detection_list.append(predict_data_info)
 
-	with torch.inference_mode():
-		for itr, (batch, label) in tqdm(enumerate(loader), desc='predict feature vec for test'):
-			batch = batch.to(model.DEVICE).float()
-			outputs = model.net(batch)
-			outputs = outputs.cpu().detach().numpy()
-			net_output.append(outputs)
-			label = label.numpy()
-			net_label.append(label)
-	net_output = np.concatenate(net_output)
-	net_label = np.concatenate(net_label)
-
-	svm_output = list()
-	svm_score = list()
-	for i in range(20):
-		svm_output[i] = SVMlist[i].predict(net_output)
-		svm_score[i] = SVMlist[i].decision_function(net_output)
-	pprint(svm_output)
-	pprint(svm_score)
+			make_dir(os.path.join(detection_dir, kernel))
+			img_number = imgdata[1]['annotation']['filename'].split('.')[0]
+			out_txt_file_path = os.path.join(detection_dir, kernel, img_number + '.txt')
+			with open(out_txt_file_path, mode="w") as f:
+				f.write("\n".join(detection_list))
 
 
 def main(args):
@@ -171,23 +181,36 @@ def main(args):
 
 	data_dir = args.datadir
 	roi_dir = args.roidir
+	detection_dir = args.detectiondir
+	model_dir = args.modeldir
+	for dir_path in [data_dir, roi_dir, detection_dir, model_dir]:
+		make_dir(dir_path)
 	load_model = args.load_model
+	global NUM_WORKERS
+	NUM_WORKERS = args.num_workers
+	load_roi = args.load_roi
+
 	data = get_VOCData(data_dir, args.voc)
 	train_data = data['trainval']
-	# make_ROIs(train_data , roi_dir)  # 5011
+	test_data = data['test']
+	if not load_roi:
+		search(train_data, roi_dir)  # 5011
+		search(test_data, roi_dir)  # 4952
 
-	model = MyModel()
-	train_net(model, train_data, roi_dir, load_model)
+	model = MyModel(model_dir)
+	train_net(model, train_data, roi_dir, model_dir, load_model)
+	train_svm(model, train_data, roi_dir, model_dir, load_model)
 
-	SVMlist = [LinearSVC() for _ in range(20)]
-	train_svm(SVMlist, model, train_data, roi_dir)
-
-	# make_ROIs(data['test'], roi_dir)  # 4952
-	predict(model, SVMlist, data['test'], roi_dir)
+	predict(model, test_data, roi_dir, model_dir, detection_dir)
 
 
 if __name__ == '__main__':
 	parser = argparse.ArgumentParser("RCNN: VOC2007 data only")
+	parser.add_argument(
+		'--num_workers',
+		type=int,
+		default=0,
+	)
 	#  Test data is valid only for 2007
 	parser.add_argument(
 		'--voc',
@@ -205,47 +228,26 @@ if __name__ == '__main__':
 	parser.add_argument(
 		'--roidir',
 		type=str,
-		default='./ROIs',
+		default='./ROI',
+	)
+	parser.add_argument(
+		'--detectiondir',
+		type=str,
+		default='./detection',
+	)
+	parser.add_argument(
+		'--modeldir',
+		type=str,
+		default='./model_param',
 	)
 	parser.add_argument(
 		'--load_model',
 		action='store_true',
 	)
+	parser.add_argument(
+		'--load_roi',
+		action='store_true',
+	)
+
 	args = parser.parse_args()
 	main(args)
-	# train_loader = make_CNN_loader(data['trainval'], roi_dir)
-	# cnn_model = MyModel()
-	# cnn_model.train(train_loader)
-	# x_train, y_train = make_SVM_loader(data['train'], cnn_model)
-
-	# SVMlist = [SVC() for _ in range(20)]
-	# for i in range(20):
-	# 	if len(np.unique(y_train[i])) == 1:
-	# 		continue
-	# 	SVMlist[i].fit(x_train[i], y_train[i])
-	#
-	# predicts = list()
-	# for i in range(20):
-	# 	predicts.append(SVMlist[i].predict(x_train[i]))
-	# predicts = np.array(predicts)
-	# iou = predicts >= 0.03
-	# print(iou)
-	# transform = transforms.Compose(
-	# 	[transforms.Resize((224, 224)), transforms.Normalize(mean=[0.485, 0.456, 0.406], std=[0.229, 0.224, 0.225])])
-	# for img, a in tqdm(data['test']):
-	# 	annotation = a['annotation']
-	# 	target_num = annotation['filename'].split('.')[0]
-	# 	api = API_mAP_detect_txt(annotation['filename'], data_dir)
-	# 	proposal_bboxes = np.load(os.path.join(roi_dir, target_num + '.npy'))
-	# 	target_label_info = get_target_labels(annotation['object'])
-	# 	tensor_img = transforms.functional.to_tensor(img)
-	# 	for label in target_label_info:
-	# 		proposal_img = tensor_img[:, label['bbox'][1]:label['bbox'][3], label['bbox'][0]:label['bbox'][2]]
-	#
-	# 		input_img = proposal_img.unsqueeze(dim=0)
-	# 		x_feature = cnn_model.predict(transform(input_img))
-	# 		for i in range(20):
-	# 			iou = SVMlist[i].predict(x_feature)
-	# 			if iou == 1:
-	# 				api.iter(label['target_idx'], iou, label['bbox'][0], label['bbox'][1], label['bbox'][2] - label['bbox'][0], label['bbox'][3] - label['bbox'][1])
-	# 	api.make_txt()
